@@ -34,6 +34,7 @@
 #include <mutex>
 #include <random>
 #include <sstream>
+#include <system_error>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -503,6 +504,10 @@ public:
         curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
         curl_easy_setopt(c, CURLOPT_TIMEOUT, 60L);
         curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, kConnectTimeoutSec);
+        // Several of these run at once on different threads; without
+        // NOSIGNAL libcurl may use SIGALRM to time out name resolution,
+        // which is not thread-safe.
+        curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
         curl_easy_setopt(c, CURLOPT_USERAGENT, "lgpd/2.0");
         CURLcode res = curl_easy_perform(c);
         long code = 0;
@@ -559,6 +564,7 @@ public:
         curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
         curl_easy_setopt(c, CURLOPT_TIMEOUT, 600L);
         curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, kConnectTimeoutSec);
+        curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
         curl_easy_setopt(c, CURLOPT_USERAGENT, "lgpd/2.0");
         // Reports the FINAL response's size, after FOLLOWLOCATION has chased
         // redirects — needed for GitHub release assets, where only the
@@ -587,29 +593,58 @@ public:
     }
 };
 
-// Run fn(0..n-1) on one thread each and join. Repositories number in the
-// single digits, so a thread per item is simpler than a pool, and a refresh
-// costs the slowest fetch instead of the sum of all of them. An exception
-// thrown by any item is rethrown here once every thread has joined, so the
-// caller sees the same failure a serial loop would have raised.
+// At most this many fetches run at once. With includes a refresh can touch a
+// few dozen catalogs; a fixed bound keeps the threads, curl handles and TLS
+// connections in check while still overlapping the waits.
+constexpr size_t kMaxConcurrentFetches = 8;
+
+// Run fn(0..n-1) on up to kMaxConcurrentFetches threads, the calling thread
+// included, each taking the next index until none are left; returns once all
+// are done. A refresh then costs roughly the slowest fetch per batch instead
+// of the sum of all of them.
+//
+// After an exception from fn, no further items are started, and the first
+// exception is rethrown once every thread has joined, so the caller sees the
+// failure a serial loop would have raised. If a helper thread cannot be
+// created, the threads already started are still joined and the calling
+// thread works through what is left, so a starved system degrades to the old
+// serial loop instead of terminating.
+//
+// Not reentrant by design: fn must not call forEachConcurrently itself, so
+// the bound holds for the whole process.
 void forEachConcurrently(size_t n, const std::function<void(size_t)>& fn) {
     if (n == 0) return;
     if (n == 1) { fn(0); return; }
-    std::vector<std::thread> threads;
-    threads.reserve(n);
+
+    std::atomic<size_t> next{0};
+    std::atomic<bool> failed{false};
     std::mutex errMu;
     std::exception_ptr firstError;
-    for (size_t i = 0; i < n; ++i) {
-        threads.emplace_back([&, i] {
+    auto work = [&] {
+        while (!failed.load()) {
+            const size_t i = next.fetch_add(1);
+            if (i >= n) return;
             try {
                 fn(i);
             } catch (...) {
                 std::lock_guard<std::mutex> lock(errMu);
                 if (!firstError) firstError = std::current_exception();
+                failed = true;
             }
-        });
+        }
+    };
+
+    std::vector<std::thread> helpers;
+    const size_t wanted = std::min(n, kMaxConcurrentFetches) - 1;
+    try {
+        helpers.reserve(wanted);
+        for (size_t t = 0; t < wanted; ++t) helpers.emplace_back(work);
+    } catch (const std::exception&) {
+        // std::system_error from thread creation, or bad_alloc: carry on
+        // with the helpers that did start, plus this thread.
     }
-    for (auto& t : threads) t.join();
+    work();
+    for (auto& t : helpers) t.join();
     if (firstError) std::rethrow_exception(firstError);
 }
 
@@ -982,20 +1017,20 @@ struct RepositoryRegistry::Impl {
         std::vector<IncludeWarning> warnings;
     };
 
-    // Walk includes[] from every configured repository in `roots`. Each root
-    // is walked on its own thread; the results are concatenated in root
-    // order, which is the order derivedRepos has always had.
+    // Walk includes[] from every configured repository in `roots`, one root
+    // after another, in root order, which is the order derivedRepos has
+    // always had. Within a root each breadth-first wave is fetched at once;
+    // walking roots sequentially keeps that the only level of concurrency,
+    // so the fetch bound holds (and in practice few roots declare includes).
     //
     // Best-effort throughout. A derived node that fails to resolve is KEPT,
     // carrying its resolveError, so `repo list` can show why a catalog the
     // user expected is missing — dropping it here is what makes an include
     // look like it was never declared.
     static IncludeWalk walkIncludes(Fetcher& f, const std::vector<Repository>& roots) {
-        std::vector<IncludeWalk> perRoot(roots.size());
-        forEachConcurrently(roots.size(),
-                            [&](size_t i) { perRoot[i] = walkRoot(f, roots[i]); });
         IncludeWalk out;
-        for (auto& w : perRoot) {
+        for (const auto& root : roots) {
+            IncludeWalk w = walkRoot(f, root);
             for (auto& d : w.derived) out.derived.push_back(std::move(d));
             for (auto& x : w.warnings) out.warnings.push_back(std::move(x));
         }
@@ -1229,8 +1264,8 @@ std::string RepositoryRegistry::refresh() {
     // Snapshot the configured rows and the fetcher, fetch every repository at
     // once with the mutex RELEASED, then merge the results back by URL.
     // Holding the lock across one fetch after another meant a single slow
-    // host stalled list() and findByUrlOrName() — and with them every call
-    // into the module — for the sum of all fetch times. A row removed while
+    // host stalled list() and findByUrlOrName() for the sum of all fetch
+    // times. A row removed while
     // the fetch ran is dropped; one added meanwhile was resolved by
     // addRepository itself; an enabled flag toggled meanwhile wins over the
     // stale snapshot.
@@ -1329,9 +1364,6 @@ struct PackageDownloaderLib::Impl {
     std::unordered_map<std::string, std::string> indexJsonByRepoUrl;
     // Repos whose index fetch last failed: reading one later changes the catalog.
     std::unordered_set<std::string> failedIndexRepoUrls;
-    // repo url -> why its last index fetch failed, so a cache-only read after
-    // prefetchIndexes() reports the real reason instead of fetching again.
-    std::unordered_map<std::string, std::string> indexErrorByRepoUrl;
     std::atomic<uint64_t> catalogRevision{0};
     // True once registry.refresh() has resolved every repo's
     // logos-repo.json this process. Guards ensureMetadata so a catalog
@@ -1362,13 +1394,7 @@ struct PackageDownloaderLib::Impl {
     // `err` receives the transport's reason when the index cannot be read.
     // Without it an unreachable catalog is indistinguishable from one that
     // simply does not carry the package.
-    //
-    // `cacheOnly` is for reads that follow prefetchIndexes(): every index was
-    // just attempted, so a miss means that attempt failed, and fetching it
-    // again would wait out the same failure a second time, one repository
-    // after another.
-    std::string fetchIndex(const Repository& r, std::string* err = nullptr,
-                           bool cacheOnly = false) {
+    std::string fetchIndex(const Repository& r, std::string* err = nullptr) {
         if (r.indexUrl.empty()) {
             if (err) *err = "repository metadata declares no indexUrl";
             return {};
@@ -1379,65 +1405,77 @@ struct PackageDownloaderLib::Impl {
             std::lock_guard<std::mutex> lock(mu);
             auto it = indexJsonByRepoUrl.find(r.url);
             if (it != indexJsonByRepoUrl.end()) return it->second;
-            if (cacheOnly) {
-                if (err) {
-                    auto e = indexErrorByRepoUrl.find(r.url);
-                    *err = e != indexErrorByRepoUrl.end() ? e->second
-                                                          : "index unavailable";
-                }
-                return {};
-            }
             f = fetcher;
         }
         std::string body;
         FetchResult result = f->get(r.indexUrl, body);
 
         if (!result.ok) {
-            const std::string why = "index fetch failed: " + r.indexUrl +
-                                    (result.error.empty() ? "" : " - " + result.error);
             {
                 std::lock_guard<std::mutex> lock(mu);
                 failedIndexRepoUrls.insert(r.url);
-                indexErrorByRepoUrl[r.url] = why;
             }
-            if (err) *err = why;
+            if (err)
+                *err = "index fetch failed: " + r.indexUrl +
+                       (result.error.empty() ? "" : " - " + result.error);
             return {};
         }
 
         std::lock_guard<std::mutex> lock(mu);
         indexJsonByRepoUrl[r.url] = body;
-        indexErrorByRepoUrl.erase(r.url);
         if (failedIndexRepoUrls.erase(r.url)) ++catalogRevision;
         return body;
     }
 
-    // Fetch the index of every repository in `repos` that is not cached yet,
-    // all at once, so the fetchIndex(..., cacheOnly) reads that follow are
-    // cache hits. A catalog over N repositories then costs the slowest index
-    // instead of the sum of all of them. Callers pass exactly the
-    // repositories they are about to read. A URL already queued is skipped (a
-    // diamond of includes lists the same catalog twice). Failures are
-    // recorded, never raised.
-    void prefetchIndexes(const std::vector<Repository>& repos) {
-        std::vector<const Repository*> pending;
-        {
-            std::lock_guard<std::mutex> lock(mu);
-            std::unordered_set<std::string> queued;
-            for (const auto& r : repos) {
-                if (r.indexUrl.empty()) continue;
-                if (indexJsonByRepoUrl.count(r.url)) continue;
-                if (!queued.insert(r.url).second) continue;
-                pending.push_back(&r);
+    // One index as read for a single call: the body, or why it is missing.
+    struct IndexRead {
+        std::string body;
+        std::string err;
+    };
+    // repo url -> its index, for the call that read them.
+    using IndexReads = std::unordered_map<std::string, IndexRead>;
+
+    // Read the index of every repository in `repos` at once (cached ones are
+    // returned from the cache) and hand the results back to the caller. A
+    // catalog over N repositories then costs about the slowest index instead
+    // of the sum of all of them. The results belong to this call: a
+    // clearCaches() from a concurrent refresh cannot make them disappear
+    // between the fetch and the read. Callers pass exactly the repositories
+    // they are about to read; a URL listed twice (a diamond of includes) is
+    // read once.
+    IndexReads prefetchIndexes(const std::vector<Repository>& repos) {
+        std::vector<const Repository*> unique;
+        std::unordered_set<std::string> seen;
+        for (const auto& r : repos) {
+            if (seen.insert(r.url).second) unique.push_back(&r);
+        }
+        std::vector<IndexRead> out(unique.size());
+        forEachConcurrently(unique.size(), [&](size_t i) {
+            out[i].body = fetchIndex(*unique[i], &out[i].err);
+        });
+        IndexReads reads;
+        for (size_t i = 0; i < unique.size(); ++i)
+            reads.emplace(unique[i]->url, std::move(out[i]));
+        return reads;
+    }
+
+    // `r`'s index from `reads` when the caller prefetched it, else fetched
+    // (or served from the cache) as before.
+    std::string indexFor(const Repository& r, const IndexReads* reads,
+                         std::string* err = nullptr) {
+        if (reads) {
+            auto it = reads->find(r.url);
+            if (it != reads->end()) {
+                if (err) *err = it->second.err;
+                return it->second.body;
             }
         }
-        forEachConcurrently(pending.size(),
-                            [&](size_t i) { fetchIndex(*pending[i]); });
+        return fetchIndex(r, err);
     }
 
     void clearCaches() {
         indexJsonByRepoUrl.clear();
         failedIndexRepoUrls.clear();
-        indexErrorByRepoUrl.clear();
     }
 
     // Does `source`'s include filter admit this package at all? Returns the
@@ -1665,15 +1703,13 @@ struct PackageDownloaderLib::Impl {
                         const std::vector<Repository>& all,
                         std::vector<std::string>* warnings,
                         const std::string& storageNetwork = {},
-                        bool cacheOnly = false) {
+                        const IndexReads* reads = nullptr) {
         json entries = json::array();
-        appendCatalogEntries(root, root, fetchIndex(root, nullptr, cacheOnly),
-                             storageNetwork, entries);
+        appendCatalogEntries(root, root, indexFor(root, reads), storageNetwork, entries);
         for (const auto& d : all) {
             if (!d.isDerived || d.rootUrl != root.url) continue;
             if (!d.resolveError.empty()) continue;
-            appendCatalogEntries(d, root, fetchIndex(d, nullptr, cacheOnly),
-                                 storageNetwork, entries);
+            appendCatalogEntries(d, root, indexFor(d, reads), storageNetwork, entries);
         }
         return mergeCatalogEntries(entries, warnings);
     }
@@ -1777,7 +1813,7 @@ static std::vector<Repository> catalogRepos(const std::vector<Repository>& all) 
 std::string PackageDownloaderLib::getCatalogJson() {
     impl_->ensureMetadata();
     const auto all = impl_->registry.listAll();
-    impl_->prefetchIndexes(catalogRepos(all));
+    const auto reads = impl_->prefetchIndexes(catalogRepos(all));
     const std::string storageNetwork = impl_->readStorageNetwork();
     json out = json::array();
     // Merge per configured repository, not across all of them: two repos
@@ -1788,8 +1824,7 @@ std::string PackageDownloaderLib::getCatalogJson() {
         if (r.isDerived) continue;
         if (!r.enabled) continue;
         if (!r.resolveError.empty()) continue;
-        for (auto& e : impl_->catalogForRoot(r, all, nullptr, storageNetwork,
-                                             /*cacheOnly=*/true))
+        for (auto& e : impl_->catalogForRoot(r, all, nullptr, storageNetwork, &reads))
             out.push_back(std::move(e));
     }
     return out.dump();
@@ -1819,9 +1854,8 @@ std::string PackageDownloaderLib::getCatalogForRepoJson(const std::string& urlOr
             if (d.isDerived && d.rootUrl == repo->url && d.resolveError.empty())
                 scope.push_back(d);
         }
-        impl_->prefetchIndexes(scope);
-        return impl_->catalogForRoot(*repo, all, nullptr, storageNetwork,
-                                     /*cacheOnly=*/true).dump();
+        const auto reads = impl_->prefetchIndexes(scope);
+        return impl_->catalogForRoot(*repo, all, nullptr, storageNetwork, &reads).dump();
     }
     json out = json::array();
     impl_->appendCatalogEntries(*repo, *repo, impl_->fetchIndex(*repo), storageNetwork, out);
@@ -1850,14 +1884,14 @@ std::string PackageDownloaderLib::refreshCatalogs() {
     // Then re-fetch the indexes themselves. refresh() above resolves only
     // logos-repo.json, so a catalog whose index.json was unreachable still
     // reported success here while every later browse quietly returned
-    // nothing. All at once, then read back from the cache. Not holding mu:
-    // fetchIndex takes it.
+    // nothing. All at once; the results are this call's own. Not holding
+    // mu: fetchIndex takes it.
     const auto all = impl_->registry.listAll();
-    impl_->prefetchIndexes(catalogRepos(all));
+    const auto reads = impl_->prefetchIndexes(catalogRepos(all));
     for (const auto& r : all) {
         if (!r.enabled || !r.resolveError.empty()) continue;
         std::string err;
-        if (impl_->fetchIndex(r, &err, /*cacheOnly=*/true).empty()) {
+        if (impl_->indexFor(r, &reads, &err).empty()) {
             out += r.url;
             if (r.isDerived) out += " (included via " + r.viaUrl + ")";
             out += ": " + (err.empty() ? "index unavailable" : err) + "\n";
@@ -1879,7 +1913,7 @@ std::string PackageDownloaderLib::refreshCatalogs() {
     std::vector<std::string> warnings;
     for (const auto& r : all) {
         if (r.isDerived || !r.enabled || !r.resolveError.empty()) continue;
-        impl_->catalogForRoot(r, all, &warnings, {}, /*cacheOnly=*/true);
+        impl_->catalogForRoot(r, all, &warnings, {}, &reads);
     }
     for (const auto& w : warnings) out += w + "\n";
     return out;
@@ -2296,14 +2330,14 @@ std::string PackageDownloaderLib::downloadPackage(const std::string& repoUrlOrNa
     std::string pickedVersionStr;
     std::string pickedDate;
 
-    // Every candidate's index at once; the loop below reads them back.
-    impl_->prefetchIndexes(candidates);
+    // Every candidate's index at once; the loop below reads the results.
+    const auto reads = impl_->prefetchIndexes(candidates);
     if (cancelled("")) return {};
 
     for (const auto& repo : candidates) {
         if (cancelled("")) return {};
         std::string fetchErr;
-        std::string body = impl_->fetchIndex(repo, &fetchErr, /*cacheOnly=*/true);
+        std::string body = impl_->indexFor(repo, &reads, &fetchErr);
         if (cancelled("")) return {};
         if (body.empty()) {
             notes.push_back(repo.url + ": " +

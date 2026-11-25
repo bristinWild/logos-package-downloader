@@ -442,6 +442,7 @@ The test suite (`tests/test_downloader.cpp`, GoogleTest via CTest) covers:
 | `Concurrency.BrokenIndexIsIsolatedReportedAndRecovers` | A repo whose `index.json` is down drops out of the catalog alone, is named with the transport's reason by `refreshCatalogs()`, and is back once the index answers again. |
 | `Concurrency.BrokenRepoMetadataDoesNotHideTheOthers` | A repo whose `logos-repo.json` is down is reported; the other repos' packages are still served. |
 | `Concurrency.IncludedCatalogsAreFetchedAtOnceAndKeepTheirOrder` | The include walk fetches sibling catalogs at once and keeps the declared order, which is the merge precedence. |
+| `Concurrency.AtMostEightFetchesRunAtOnce` | With twenty repositories, fetches overlap but never more than eight run at once, and every repository resolves. |
 | `FetchSelection.StorageCidIsPreferredOverTheHttpsMirror` | Logos Storage is used when it can download the package. |
 | `FetchSelection.StorageCidIsPreferredWhenListedAfterTheHttpsMirror` | Logos Storage is used first, whatever the order in `urls`. |
 | `FetchSelection.HttpsTakesOverWhenTheStorageDownloadFails` | https is used when Logos Storage fails. |

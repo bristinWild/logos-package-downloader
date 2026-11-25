@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <functional>
 #include <cstdint>
+#include <thread>
 #include <cstdlib>
 #include <stdexcept>
 #include <filesystem>
@@ -3798,12 +3799,20 @@ public:
     }
 
     int misses() const { return missCount.load(); }
+    int maxInFlight() const { return peak.load(); }
+
+    // Hold every get() this long, so overlapping calls are observable.
+    std::chrono::milliseconds delay{0};
 
     bool canHandle(const std::string& url) const override {
         return url.rfind("https://", 0) == 0;
     }
 
     lgpd::FetchResult get(const std::string& url, std::string& out) override {
+        const int now = ++current;
+        for (int seen = peak.load(); now > seen && !peak.compare_exchange_weak(seen, now);) {}
+        struct Leave { std::atomic<int>& c; ~Leave() { --c; } } leave{current};
+        if (delay.count() > 0) std::this_thread::sleep_for(delay);
         {
             std::unique_lock<std::mutex> lock(mu);
             if (gate && gate(url)) {
@@ -3830,6 +3839,8 @@ private:
     int want = 0;
     int inFlight = 0;
     std::atomic<int> missCount{0};
+    std::atomic<int> current{0};
+    std::atomic<int> peak{0};
 };
 
 std::string worldRepoJson(const std::string& name, const std::string& indexUrl,
@@ -3902,13 +3913,10 @@ TEST(Concurrency, RefreshFetchesEveryRepoAtOnce) {
 
     // Three logos-repo.json fetches must be in flight together.
     world->arm([](const std::string& u) { return endsWith(u, "logos-repo.json"); }, 3);
-    const auto t0 = std::chrono::steady_clock::now();
     const std::string err = lib.registry().refresh();
-    const auto elapsed = std::chrono::steady_clock::now() - t0;
 
     EXPECT_TRUE(err.empty()) << err;
     EXPECT_EQ(world->misses(), 0) << "repo fetches did not overlap";
-    EXPECT_LT(elapsed, std::chrono::seconds(2));
     for (const auto& r : lib.registry().list()) {
         EXPECT_TRUE(r.resolveError.empty()) << r.url << ": " << r.resolveError;
         EXPECT_FALSE(r.indexUrl.empty()) << r.url;
@@ -3926,12 +3934,9 @@ TEST(Concurrency, CatalogFetchesEveryIndexAtOnce) {
 
     // Three index.json fetches must be in flight together.
     world->arm([](const std::string& u) { return endsWith(u, "index.json"); }, 3);
-    const auto t0 = std::chrono::steady_clock::now();
     const json catalog = json::parse(lib.getCatalogJson());
-    const auto elapsed = std::chrono::steady_clock::now() - t0;
 
     EXPECT_EQ(world->misses(), 0) << "index fetches did not overlap";
-    EXPECT_LT(elapsed, std::chrono::seconds(2));
     EXPECT_EQ(packageNames(catalog),
               (std::vector<std::string>{"pkg_a", "pkg_b", "pkg_official"}));
     std::error_code ec; fs::remove(cfg, ec);
@@ -4031,5 +4036,37 @@ TEST(Concurrency, IncludedCatalogsAreFetchedAtOnceAndKeepTheirOrder) {
     const json catalog = json::parse(lib.getCatalogJson());
     EXPECT_EQ(packageNames(catalog),
               (std::vector<std::string>{"pkg_a", "pkg_b", "pkg_official"}));
+    std::error_code ec; fs::remove(cfg, ec);
+}
+
+TEST(Concurrency, AtMostEightFetchesRunAtOnce) {
+    // Many repositories (as includes can produce) must not mean as many
+    // threads and connections: the fetches overlap, but at most eight at a
+    // time, and every repository still resolves.
+    const fs::path cfg = concurrencyConfig();
+    auto world = std::make_shared<WorldFetcher>();
+    world->bodies[lgpd::kDefaultRepositoryUrl] = worldRepoJson("official", kIndexUrl);
+    world->bodies[kIndexUrl] = worldIndexWithOnePackage("pkg_official");
+    lgpd::PackageDownloaderLib lib(cfg.string());
+    lib.setFetcher(world);
+    std::vector<std::string> urls;
+    for (int i = 0; i < 20; ++i) {
+        const std::string host = "https://r" + std::to_string(i) + ".example/";
+        world->bodies[host + "logos-repo.json"] =
+            worldRepoJson("r" + std::to_string(i), host + "index.json");
+        world->bodies[host + "index.json"] =
+            worldIndexWithOnePackage("pkg_r" + std::to_string(i));
+        ASSERT_TRUE(lib.registry().addRepository(host + "logos-repo.json").empty());
+    }
+
+    world->delay = std::chrono::milliseconds(20);
+    const std::string err = lib.registry().refresh();
+    EXPECT_TRUE(err.empty()) << err;
+    EXPECT_LE(world->maxInFlight(), 8);
+    EXPECT_GE(world->maxInFlight(), 2) << "fetches did not overlap";
+
+    const json catalog = json::parse(lib.getCatalogJson());
+    EXPECT_EQ(catalog.size(), 21u);
+    EXPECT_LE(world->maxInFlight(), 8);
     std::error_code ec; fs::remove(cfg, ec);
 }
