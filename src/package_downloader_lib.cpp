@@ -387,6 +387,14 @@ std::string cacheBustedUrl(const std::string& url) {
            std::to_string(n);
 }
 
+// Upper bound on a single connection attempt. Without it libcurl gives the
+// first address a host resolves to a large share of CURLOPT_TIMEOUT before
+// trying the next, so one address that silently drops connections (one of
+// a CDN's several) stalled each catalog fetch ~30 s and a package download
+// for minutes (logos-package-downloader-module#23). With this cap the same
+// fault costs ~5 s, and the transfer still succeeds via the next address.
+constexpr long kConnectTimeoutSec = 10;
+
 // Point libcurl at a CA-certificate bundle from the host system.
 //
 // nixpkgs builds curl against OpenSSL whose only built-in trust anchor is
@@ -492,6 +500,7 @@ public:
         curl_easy_setopt(c, CURLOPT_WRITEDATA, &out);
         curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
         curl_easy_setopt(c, CURLOPT_TIMEOUT, 60L);
+        curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, kConnectTimeoutSec);
         curl_easy_setopt(c, CURLOPT_USERAGENT, "lgpd/2.0");
         CURLcode res = curl_easy_perform(c);
         long code = 0;
@@ -547,6 +556,7 @@ public:
         curl_easy_setopt(c, CURLOPT_WRITEDATA, &f);
         curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
         curl_easy_setopt(c, CURLOPT_TIMEOUT, 600L);
+        curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, kConnectTimeoutSec);
         curl_easy_setopt(c, CURLOPT_USERAGENT, "lgpd/2.0");
         // Reports the FINAL response's size, after FOLLOWLOCATION has chased
         // redirects — needed for GitHub release assets, where only the
